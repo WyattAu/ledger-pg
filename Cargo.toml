@@ -1,0 +1,24 @@
+[package]
+name = "ledger-pg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PostgreSQL persistence for double-entry ledgers — per-tenant isolation, optimistic concurrency via conditional update, period close, atomic reversal"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WyattAu/ledger-pg"
+keywords = ["accounting", "postgres", "ledger", "double-entry", "database"]
+categories = ["database", "finance"]
+
+[dependencies]
+double-entry = "=0.1.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"

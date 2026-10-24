@@ -1,6 +1,6 @@
 [package]
 name = "ledger-pg"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "PostgreSQL persistence for double-entry ledgers — per-tenant isolation, optimistic concurrency via conditional update, period close, atomic reversal"
@@ -10,7 +10,7 @@ keywords = ["accounting", "postgres", "ledger", "double-entry", "database"]
 categories = ["database", "finance"]
 
 [dependencies]
-double-entry = "=0.1.0"
+double-entry = "=0.1.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 thiserror = "2"
 

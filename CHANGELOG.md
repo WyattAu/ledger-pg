@@ -5,6 +5,17 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-24
+
+### Changed
+
+- `into_ledger` takes the account **class chart** as a closure. The previous
+  default (every account an asset) made a P&L over the rebuilt books see no
+  revenue class and silently report a zero retained result — the class is
+  accounting knowledge the ledger does not store, so it is now a required,
+  visible call-site decision.
+
+
 ## [0.1.0] - 2026-10-24
 
 Initial release.

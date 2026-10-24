@@ -508,9 +508,17 @@ fn chrono_date_today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Convenience: build a fresh in-memory [`Ledger`] view from the stored
-/// posted entries, for `report-kit` to aggregate.
-pub async fn into_ledger(handle: &PgLedger) -> Result<Ledger, PgLedgerError> {
+/// Build a fresh in-memory [`Ledger`] view from the stored posted entries,
+/// for `report-kit` to aggregate.
+///
+/// The account **class** is the caller's knowledge — the ledger stores
+/// postings, and a class guessed from an account id prefix would be a
+/// assumption wearing a default. Supply the chart; the closure is asked once
+/// per account.
+pub async fn into_ledger(
+    handle: &PgLedger,
+    class_of: impl Fn(&str) -> AccountType,
+) -> Result<Ledger, PgLedgerError> {
     let entries = handle.posted_entries().await?;
     let mut ledger = Ledger::new();
     let mut version = 0u64;
@@ -518,7 +526,7 @@ pub async fn into_ledger(handle: &PgLedger) -> Result<Ledger, PgLedgerError> {
         for line in &entry.lines {
             let id = line.account.as_str();
             if !ledger.has_account(&double_entry::AccountId::new(id.to_string())) {
-                ledger.add_account(Account::new(id, id, AccountType::Asset));
+                ledger.add_account(Account::new(id, id, class_of(id)));
             }
         }
         // Re-post through the public path: balance is re-validated (it held

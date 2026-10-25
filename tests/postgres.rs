@@ -118,7 +118,7 @@ async fn posting_round_trips_and_balances_survive_the_database() {
         24_000
     );
     // Rebuild an in-memory ledger and let report-kit read it.
-        // Balances need no class, so the chart is a constant here.
+    // Balances need no class, so the chart is a constant here.
     let rebuilt = into_ledger(&ledger, |_| double_entry::AccountType::Asset)
         .await
         .expect("rebuilds");

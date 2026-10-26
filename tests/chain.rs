@@ -139,7 +139,7 @@ async fn the_chain_verifies_clean_after_normal_posting() {
     let verification = verify_chain(&ledger).await.expect("walks");
     assert_eq!(verification.broken_at, None, "no tampering, no break");
     assert_eq!(
-        verification.chained, 5,
+        verification.chained, 4,
         "JE-1, its reversal, JE-2 and JE-3 all chained"
     );
     cleanup(&pg, ledger.pool()).await;

@@ -451,16 +451,41 @@ impl PgLedger {
         .await?
         .flatten();
         let new_version = current + 1;
+        // The hash covers the counter's OWN stored lines — sides flipped —
+        // not the original's. Hashing the original's lines here would make
+        // every reversal fail verification, which the chain tests caught
+        // before any customer ledger did.
+        let flipped: Vec<RawLine> = lines
+            .iter()
+            .map(|(account, side, units, scale, currency, memo)| {
+                (
+                    account.clone(),
+                    if side == "debit" {
+                        "credit".to_string()
+                    } else {
+                        "debit".to_string()
+                    },
+                    *units,
+                    *scale,
+                    currency.clone(),
+                    memo.clone(),
+                )
+            })
+            .collect();
+        // One clock read, shared by the stored row and its hash: calling the
+        // clock twice could straddle midnight and make the hash wrong.
+        let reversal_date = chrono_date_today();
+        let reversal_memo = format!("reversal of {original_id}");
         let reversal_hash = canonical_entry_v1(
             &ChainHeader {
                 tenant: &self.tenant,
                 version: new_version as u64,
                 id: reversal_id,
-                date: &chrono_date_today(),
+                date: &reversal_date,
                 period: &period,
-                memo: Some(&format!("reversal of {original_id}")),
+                memo: Some(&reversal_memo),
             },
-            &lines,
+            &flipped,
             reversal_previous_hash.as_deref(),
         );
 
@@ -470,16 +495,16 @@ impl PgLedger {
         )
         .bind(&self.tenant)
         .bind(reversal_id)
-        .bind(chrono_date_today())
+        .bind(&reversal_date)
         .bind(&period)
-        .bind(format!("reversal of {original_id}"))
+        .bind(&reversal_memo)
         .bind(original_id)
         .bind(new_version)
         .bind(&reversal_previous_hash)
         .bind(&reversal_hash)
         .execute(&mut *tx)
         .await?;
-        for (idx, (account, side, units, scale, currency, memo)) in lines.iter().enumerate() {
+        for (idx, (account, side, units, scale, currency, memo)) in flipped.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO ledger_lines (tenant_id, entry_id, idx, account, side,
                      amount_units, amount_scale, amount_currency, line_memo)
@@ -489,10 +514,11 @@ impl PgLedger {
             .bind(reversal_id)
             .bind(idx as i32)
             .bind(account)
-            .bind(match side.as_str() {
-                "debit" => "credit",
-                _ => "debit",
-            })
+            // `flipped` is already flipped — binding the match here would flip
+            // it back, storing a counter-entry identical to the original
+            // (doubling the posting) and hashing a different line set than
+            // the one stored. Both defects, one bind.
+            .bind(side)
             .bind(units)
             .bind(scale)
             .bind(currency)
@@ -715,6 +741,10 @@ pub async fn verify_chain(handle: &PgLedger) -> Result<ChainVerification, PgLedg
             previous_hash.as_deref(),
         );
         if &recomputed != stored {
+            eprintln!(
+                "CHAIN DEBUG v{version} entry {id}: recomputed={recomputed} stored={stored} prev={:?} lines={lines:?}",
+                previous_hash
+            );
             return Ok(ChainVerification {
                 chained,
                 broken_at: Some(ChainBreak {

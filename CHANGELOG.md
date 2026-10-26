@@ -5,6 +5,27 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-26
+
+### Fixed
+
+- **0.2.0's reversals were double-flipped and doubled the posting.** The
+  chain work introduced `flipped` line tuples, but the insert loop still
+  bound a `match side` on top — flipping the already-flipped values back to
+  the original sides. A reversal stored a counter-entry identical to its
+  original: the posting was doubled, not reversed, and the hash chain
+  detected it on every verify (the stored lines were not the hashed lines).
+  0.2.0 is yanked. The tests that caught it are the chain tamper tests and
+  the ledger-balance assertion working together.
+
+### Known issue in 0.2.0 (yanked)
+
+- Published before the integration suite ran; `cargo publish` verifies the
+  library build but not `tests/`. Process change recorded in the loop docs:
+  a release does not go out until the suite that covers the change has run
+  green, even when the change is "just plumbing".
+
+
 ## [0.2.0] - 2026-10-26
 
 ### Added

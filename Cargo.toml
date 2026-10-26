@@ -1,6 +1,6 @@
 [package]
 name = "ledger-pg"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "PostgreSQL persistence for double-entry ledgers — per-tenant isolation, optimistic concurrency via conditional update, period close, atomic reversal"

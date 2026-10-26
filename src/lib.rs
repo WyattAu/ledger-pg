@@ -142,6 +142,18 @@ pub async fn ensure_schema(pool: &PgPool) -> Result<(), PgLedgerError> {
     )
     .execute(&mut *tx)
     .await?;
+    // The tamper-evident chain, v1 (see `entry_hash_inputs`): the columns are
+    // additive over 0.1.x installs, and the chain simply starts at the first
+    // 0.2.0 posting — pre-upgrade rows carry no hash and are chain roots.
+    sqlx::query("ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS version BIGINT")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS previous_hash TEXT")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS entry_hash TEXT")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ledger_reversals (
             tenant_id   TEXT NOT NULL,
@@ -244,15 +256,59 @@ impl PgLedger {
             .bind(current)
             .execute(&mut *tx)
             .await?;
+
+        // The chain: fetch the previous hash under the same lock (the state
+        // row's lock serialises posters, so the chain has no forks), hash,
+        // then write.
+        let previous_hash: Option<String> = sqlx::query_scalar(
+            "SELECT entry_hash FROM ledger_entries WHERE tenant_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(&self.tenant)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let raw_lines: Vec<(String, String, i64, i32, String, Option<String>)> = entry
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.account.as_str().to_string(),
+                    match line.side {
+                        Side::Debit => "debit".to_string(),
+                        Side::Credit => "credit".to_string(),
+                    },
+                    line.amount.units,
+                    line.amount.scale as i32,
+                    line.amount.currency.alpha.to_string(),
+                    line.memo.clone(),
+                )
+            })
+            .collect();
+        let entry_hash = canonical_entry_v1(
+            &ChainHeader {
+                tenant: &self.tenant,
+                version: new_version as u64,
+                id: &entry.id,
+                date: &entry.date,
+                period: &entry.period,
+                memo: entry.memo.as_deref(),
+            },
+            &raw_lines,
+            previous_hash.as_deref(),
+        );
+
         sqlx::query(
-            "INSERT INTO ledger_entries (tenant_id, id, date, period, memo, state)
-             VALUES ($1, $2, $3, $4, $5, 'posted')",
+            "INSERT INTO ledger_entries (tenant_id, id, date, period, memo, state, version, previous_hash, entry_hash)
+             VALUES ($1, $2, $3, $4, $5, 'posted', $6, $7, $8)",
         )
         .bind(&self.tenant)
         .bind(&entry.id)
         .bind(&entry.date)
         .bind(&entry.period)
         .bind(&entry.memo)
+        .bind(new_version)
+        .bind(previous_hash)
+        .bind(&entry_hash)
         .execute(&mut *tx)
         .await?;
         for (idx, line) in entry.lines.iter().enumerate() {
@@ -373,7 +429,8 @@ impl PgLedger {
 
         // The counter-entry mirrors every line's side with its amount
         // unchanged — negating the amount too would be a double negation that
-        // reverses nothing at all.
+        // reverses nothing at all. It joins the hash chain: the reversal is
+        // as much a posting as the entry it corrects.
         let lines: Vec<(String, String, i64, i32, String, Option<String>)> = sqlx::query_as(
             "SELECT account, side, amount_units, amount_scale, amount_currency, line_memo
              FROM ledger_lines WHERE tenant_id = $1 AND entry_id = $2 ORDER BY idx",
@@ -382,9 +439,34 @@ impl PgLedger {
         .bind(original_id)
         .fetch_all(&mut *tx)
         .await?;
+
+        // The counter-entry joins the chain: a reversal is as much a posting
+        // as the entry it corrects, and omitting it would let a tamperer
+        // delete a reversal without breaking the walk.
+        let reversal_previous_hash: Option<String> = sqlx::query_scalar(
+            "SELECT entry_hash FROM ledger_entries WHERE tenant_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(&self.tenant)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let new_version = current + 1;
+        let reversal_hash = canonical_entry_v1(
+            &ChainHeader {
+                tenant: &self.tenant,
+                version: new_version as u64,
+                id: reversal_id,
+                date: &chrono_date_today(),
+                period: &period,
+                memo: Some(&format!("reversal of {original_id}")),
+            },
+            &lines,
+            reversal_previous_hash.as_deref(),
+        );
+
         sqlx::query(
-            "INSERT INTO ledger_entries (tenant_id, id, date, period, memo, state, reverses)
-             VALUES ($1, $2, $3, $4, $5, 'posted', $6)",
+            "INSERT INTO ledger_entries (tenant_id, id, date, period, memo, state, reverses, version, previous_hash, entry_hash)
+             VALUES ($1, $2, $3, $4, $5, 'posted', $6, $7, $8, $9)",
         )
         .bind(&self.tenant)
         .bind(reversal_id)
@@ -392,6 +474,9 @@ impl PgLedger {
         .bind(&period)
         .bind(format!("reversal of {original_id}"))
         .bind(original_id)
+        .bind(new_version)
+        .bind(&reversal_previous_hash)
+        .bind(&reversal_hash)
         .execute(&mut *tx)
         .await?;
         for (idx, (account, side, units, scale, currency, memo)) in lines.iter().enumerate() {
@@ -479,6 +564,203 @@ impl PgLedger {
         }
         Ok(entries)
     }
+}
+
+/// A line as stored: account, side, units, scale, currency, memo. The chain
+/// hashes these raw fields — the stored scale is what was hashed, so no
+/// reconstruction through the currency table can perturb the canonical form.
+pub type RawLine = (String, String, i64, i32, String, Option<String>);
+
+/// Hash-chain format version. Bump when the canonical serialization changes;
+/// stored hashes carry no version marker in v1, so a bump means "verify
+/// stops at the first pre-bump entry" and the chain continues from there.
+pub const HASH_VERSION: u8 = 1;
+
+/// The canonical string hashed for one posted entry, chain-format v1.
+///
+/// Modeled on Odoo's `account.move` inalterability hash (SHA-256 over the
+/// previous hash plus a canonical serialization of the move and its lines),
+/// with one structural advantage: our amounts are integers, so the canonical
+/// form is deterministic without Odoo's `float_repr` stabilization — the
+/// workaround their design requires is a class of problem this estate does
+/// not have.
+///
+/// Fields, pipe-separated, in fixed order: `v1`, tenant, version, id, date,
+/// period, memo (empty for `None`), then per line in index order
+/// `account:side:units:scale:currency:memo`, then the previous hash. Any
+/// change to any of these after posting breaks every subsequent hash, so a
+/// single tampered row is detectable from the tail of the ledger.
+struct ChainHeader<'a> {
+    tenant: &'a str,
+    version: u64,
+    id: &'a str,
+    date: &'a str,
+    period: &'a str,
+    memo: Option<&'a str>,
+}
+
+fn canonical_entry_v1(
+    header: &ChainHeader<'_>,
+    lines: &[RawLine],
+    previous_hash: Option<&str>,
+) -> String {
+    let ChainHeader {
+        tenant,
+        version,
+        id,
+        date,
+        period,
+        memo,
+    } = *header;
+    use sha2::{Digest, Sha256};
+    let mut canonical = String::from("v1|");
+    canonical.push_str(tenant);
+    canonical.push('|');
+    canonical.push_str(&version.to_string());
+    canonical.push('|');
+    canonical.push_str(id);
+    canonical.push('|');
+    canonical.push_str(date);
+    canonical.push('|');
+    canonical.push_str(period);
+    canonical.push('|');
+    canonical.push_str(memo.unwrap_or(""));
+    for (account, side, units, scale, currency, line_memo) in lines {
+        canonical.push('|');
+        canonical.push_str(account);
+        canonical.push(':');
+        canonical.push_str(side);
+        canonical.push(':');
+        canonical.push_str(&units.to_string());
+        canonical.push(':');
+        canonical.push_str(&scale.to_string());
+        canonical.push(':');
+        canonical.push_str(currency);
+        canonical.push(':');
+        canonical.push_str(line_memo.as_deref().unwrap_or(""));
+    }
+    canonical.push('|');
+    canonical.push_str(previous_hash.unwrap_or(""));
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+impl PgLedger {
+    fn tenant_str(&self) -> &str {
+        &self.tenant
+    }
+
+    /// The shared pool, exposed for tamper-testing the chain from outside
+    /// the crate's own code paths.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+/// Walk the tenant's posted entries in version order and re-verify every
+/// hash in the chain.
+///
+/// Returns the number of chained entries, or where the chain broke. An
+/// unhashed row (a 0.1.x pre-upgrade entry) terminates the walk as the
+/// chain's root — reported as a clean chain over what it covered.
+pub async fn verify_chain(handle: &PgLedger) -> Result<ChainVerification, PgLedgerError> {
+    let rows: Vec<(Option<i64>, String)> = sqlx::query_as(
+        "SELECT version, entry_hash FROM ledger_entries
+         WHERE tenant_id = $1 AND entry_hash IS NOT NULL ORDER BY version",
+    )
+    .bind(handle.tenant_str())
+    .fetch_all(handle.pool())
+    .await?;
+
+    let mut chained = 0usize;
+    let mut previous_hash: Option<String> = None;
+    for (version, stored) in &rows {
+        let version = version.unwrap_or(0);
+        let Some((id, date, period, memo)): Option<(String, String, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, date, period, memo FROM ledger_entries
+             WHERE tenant_id = $1 AND version = $2",
+            )
+            .bind(handle.tenant_str())
+            .bind(version)
+            .fetch_optional(handle.pool())
+            .await?
+        else {
+            return Ok(ChainVerification {
+                chained,
+                broken_at: Some(ChainBreak {
+                    version: version as u64,
+                    entry_id: format!("<version {version}>"),
+                    reason: ChainBreakReason::EntryMissing,
+                }),
+            });
+        };
+        let lines: Vec<(String, String, i64, i32, String, Option<String>)> = sqlx::query_as(
+            "SELECT account, side, amount_units, amount_scale, amount_currency, line_memo
+             FROM ledger_lines WHERE tenant_id = $1 AND entry_id = $2 ORDER BY idx",
+        )
+        .bind(handle.tenant_str())
+        .bind(&id)
+        .fetch_all(handle.pool())
+        .await?;
+        let recomputed = canonical_entry_v1(
+            &ChainHeader {
+                tenant: handle.tenant_str(),
+                version: version as u64,
+                id: &id,
+                date: &date,
+                period: &period,
+                memo: memo.as_deref(),
+            },
+            &lines,
+            previous_hash.as_deref(),
+        );
+        if &recomputed != stored {
+            return Ok(ChainVerification {
+                chained,
+                broken_at: Some(ChainBreak {
+                    version: version as u64,
+                    entry_id: id,
+                    reason: ChainBreakReason::HashMismatch,
+                }),
+            });
+        }
+        previous_hash = Some(stored.clone());
+        chained += 1;
+    }
+    Ok(ChainVerification {
+        chained,
+        broken_at: None,
+    })
+}
+
+/// One walked-and-checked link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainVerification {
+    /// How many entries verified before the walk ended.
+    pub chained: usize,
+    /// `Some` when the chain broke: the version, the entry, and why.
+    pub broken_at: Option<ChainBreak>,
+}
+
+/// Where and why the chain broke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainBreak {
+    /// The entry's chain version.
+    pub version: u64,
+    /// The entry's id.
+    pub entry_id: String,
+    /// What failed.
+    pub reason: ChainBreakReason,
+}
+
+/// Why the chain broke at an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainBreakReason {
+    /// A stored field no longer hashes to the stored hash — the ledger was
+    /// altered outside this crate.
+    HashMismatch,
+    /// The chain references an entry that is gone.
+    EntryMissing,
 }
 
 /// `YYYY-MM-DD` for the reversal's date, without a date crate: the ledger's

@@ -5,6 +5,25 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-26
+
+### Added
+
+- **A tamper-evident hash chain over posted entries**, modeled on Odoo's
+  `account.move` inalterability hash: SHA-256 over the previous entry's hash
+  plus a canonical serialization of the entry and every line (account, side,
+  units, scale, currency, memo). The canonical form is deterministic without
+  Odoo's `float_repr` stabilization, because the amounts are integers.
+- `verify_chain` — walks the chain in version order, recomputes every hash,
+  and reports the version, entry and reason of the first break. Tamper tests
+  write through raw SQL with database credentials, deliberately bypassing the
+  crate: altered amounts, altered memos (the quiet alteration — amounts still
+  add up), and deleted entries are all detected.
+- Reversals join the chain: a reversal is as much a posting as the entry it
+  corrects, and omitting it would let a tamperer delete a reversal without
+  breaking the walk.
+
+
 ## [0.1.3] - 2026-10-24
 
 ### Changed
